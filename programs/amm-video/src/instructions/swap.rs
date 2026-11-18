@@ -11,44 +11,73 @@ use crate::{error::AmmError, state::Config};
 pub struct Swap<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
+
     pub mint_x: Box<Account<'info, Mint>>,
     pub mint_y: Box<Account<'info, Mint>>,
+
     #[account(
         has_one = mint_x,
         has_one = mint_y,
         seeds = [b"config", config.seed.to_le_bytes().as_ref()],
-        bump = config.config_bump
+        bump = config.config_bump,
     )]
     pub config: Account<'info, Config>,
+
     #[account(
         seeds = [b"lp", config.key().as_ref()],
         bump = config.lp_bump,
     )]
     pub mint_lp: Box<Account<'info, Mint>>,
+
     #[account(
         mut,
         associated_token::mint = mint_x,
         associated_token::authority = config,
     )]
     pub vault_x: Box<Account<'info, TokenAccount>>,
+
     #[account(
         mut,
         associated_token::mint = mint_y,
         associated_token::authority = config,
     )]
     pub vault_y: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: PDA is validated and used only as the treasury token-account authority.
+    #[account(
+        seeds = [b"treasury", config.key().as_ref()],
+        bump,
+    )]
+    pub treasury_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint_x,
+        associated_token::authority = treasury_authority,
+    )]
+    pub treasury_x: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint_y,
+        associated_token::authority = treasury_authority,
+    )]
+    pub treasury_y: Box<Account<'info, TokenAccount>>,
+
     #[account(
         mut,
         associated_token::mint = mint_x,
         associated_token::authority = user,
     )]
     pub user_x: Box<Account<'info, TokenAccount>>,
+
     #[account(
         mut,
         associated_token::mint = mint_y,
         associated_token::authority = user,
     )]
     pub user_y: Box<Account<'info, TokenAccount>>,
+
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub associated_token_program: Program<'info, AssociatedToken>,
@@ -57,38 +86,65 @@ pub struct Swap<'info> {
 impl<'info> Swap<'info> {
     pub fn swap(&mut self, is_x: bool, amount: u64, min: u64) -> Result<()> {
         require!(amount > 0, AmmError::InvalidAmount);
+        require!(!self.config.locked, AmmError::PoolLocked);
+
+        // Calculate the fee in basis points.
+        let fee_multiplier = 10_000u64
+            .checked_sub(self.config.fee as u64)
+            .ok_or(AmmError::InvalidFee)?;
+
+        let net_amount = (amount as u128)
+            .checked_mul(fee_multiplier as u128)
+            .ok_or(AmmError::Overflow)?
+            .checked_div(10_000)
+            .ok_or(AmmError::InvalidAmount)? as u64;
+
+        let fee_amount = amount.checked_sub(net_amount).ok_or(AmmError::Underflow)?;
+
+        require!(net_amount > 0, AmmError::InvalidAmount);
+
+        // The curve receives only the net input. Its internal fee is zero
+        // to avoid charging the user twice.
         let mut curve = ConstantProduct::init(
             self.vault_x.amount,
             self.vault_y.amount,
             self.mint_lp.supply,
-            self.config.fee,
+            0,
             Some(6),
         )
-        .unwrap();
+        .map_err(AmmError::from)?;
 
-        let p = match is_x {
-            true => LiquidityPair::X,
-            false => LiquidityPair::Y,
+        let pair = if is_x {
+            LiquidityPair::X
+        } else {
+            LiquidityPair::Y
         };
 
-        let swap_result: constant_product_curve::SwapResult = curve
-            .swap(p, amount, min)
-            .map_err(|_| AmmError::SlippageExceeded)?;
+        let swap_result = curve.swap(pair, net_amount, min).map_err(AmmError::from)?;
 
-        self.deposit_tokens(is_x, swap_result.deposit)?;
+        // Transfer the net input into the pool.
+        self.deposit_tokens(is_x, net_amount)?;
+
+        // Transfer the fee into the treasury for the input token.
+        if fee_amount > 0 {
+            self.deposit_fee(is_x, fee_amount)?;
+        }
+
+        // Transfer the output token to the user.
         self.withdraw_tokens(is_x, swap_result.withdraw)
     }
 
-    pub fn deposit_tokens(&mut self, is_x: bool, amount: u64) -> Result<()> {
-        let (from, to) = match is_x {
-            true => (
+    fn deposit_tokens(&self, is_x: bool, amount: u64) -> Result<()> {
+        let (from, to) = if is_x {
+            (
                 self.user_x.to_account_info(),
                 self.vault_x.to_account_info(),
-            ),
-            false => (
+            )
+        } else {
+            (
                 self.user_y.to_account_info(),
                 self.vault_y.to_account_info(),
-            ),
+            )
         };
 
         transfer(
@@ -104,16 +160,43 @@ impl<'info> Swap<'info> {
         )
     }
 
-    pub fn withdraw_tokens(&mut self, is_x: bool, amount: u64) -> Result<()> {
-        let (from, to) = match is_x {
-            true => (
+    fn deposit_fee(&self, is_x: bool, amount: u64) -> Result<()> {
+        let (from, to) = if is_x {
+            (
+                self.user_x.to_account_info(),
+                self.treasury_x.to_account_info(),
+            )
+        } else {
+            (
+                self.user_y.to_account_info(),
+                self.treasury_y.to_account_info(),
+            )
+        };
+
+        transfer(
+            CpiContext::new(
+                self.token_program.key(),
+                Transfer {
+                    from,
+                    to,
+                    authority: self.user.to_account_info(),
+                },
+            ),
+            amount,
+        )
+    }
+
+    fn withdraw_tokens(&self, is_x: bool, amount: u64) -> Result<()> {
+        let (from, to) = if is_x {
+            (
                 self.vault_y.to_account_info(),
                 self.user_y.to_account_info(),
-            ),
-            false => (
+            )
+        } else {
+            (
                 self.vault_x.to_account_info(),
                 self.user_x.to_account_info(),
-            ),
+            )
         };
 
         transfer(

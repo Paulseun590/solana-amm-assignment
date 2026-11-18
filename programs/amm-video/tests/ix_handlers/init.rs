@@ -3,7 +3,7 @@ use {
         solana_program::instruction::Instruction, system_program::ID as SYSTEM_PROGRAM_ID,
         InstructionData, ToAccountMetas,
     },
-    anchor_spl::associated_token::ID as ASSOCIATED_TOKEN_PROGRAM_ID,
+    anchor_spl::associated_token::{self, ID as ASSOCIATED_TOKEN_PROGRAM_ID},
     litesvm::LiteSVM,
     litesvm_token::spl_token::ID as TOKEN_PROGRAM_ID,
     solana_keypair::Keypair,
@@ -12,7 +12,7 @@ use {
 };
 
 pub fn create_initialise_ix(
-    mut _svm: &mut LiteSVM,
+    _svm: &mut LiteSVM,
     payer: &Keypair,
     mint_x: Pubkey,
     mint_y: Pubkey,
@@ -20,25 +20,36 @@ pub fn create_initialise_ix(
     mint_lp: Pubkey,
     vault_x: Pubkey,
     vault_y: Pubkey,
+    fee: u16,
 ) -> Instruction {
-    let maker = payer.pubkey();
+    let initializer = payer.pubkey();
+
+    let treasury_authority =
+        Pubkey::find_program_address(&[b"treasury", config.as_ref()], &amm_video::id()).0;
+
+    let treasury_x = associated_token::get_associated_token_address(&treasury_authority, &mint_x);
+
+    let treasury_y = associated_token::get_associated_token_address(&treasury_authority, &mint_y);
 
     Instruction::new_with_bytes(
         amm_video::id(),
         &amm_video::instruction::Initialize {
             seed: 123,
-            fee: 30,
-            authority: Some(maker),
+            fee,
+            authority: Some(initializer),
         }
         .data(),
         amm_video::accounts::Initialize {
-            initializer: maker,
+            initializer,
             mint_x,
             mint_y,
+            config,
             mint_lp,
             vault_x,
             vault_y,
-            config,
+            treasury_authority,
+            treasury_x,
+            treasury_y,
             token_program: TOKEN_PROGRAM_ID,
             associated_token_program: ASSOCIATED_TOKEN_PROGRAM_ID,
             system_program: SYSTEM_PROGRAM_ID,

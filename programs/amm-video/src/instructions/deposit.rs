@@ -83,7 +83,7 @@ impl<'info> Deposit<'info> {
                     amount,
                     6,
                 )
-                .unwrap();
+                .map_err(AmmError::from)?;
 
                 require!(
                     amounts.x <= max_x && amounts.y <= max_y,
@@ -92,6 +92,8 @@ impl<'info> Deposit<'info> {
 
                 (amounts.x, amounts.y)
             };
+
+        require!(x > 0 && y > 0, AmmError::InvalidAmount);
 
         // deposit token x
         self.deposit_tokens(true, x)?;

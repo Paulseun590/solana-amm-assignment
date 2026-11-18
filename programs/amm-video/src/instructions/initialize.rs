@@ -4,38 +4,17 @@ use anchor_spl::{
     token::{Mint, Token, TokenAccount},
 };
 
-use crate::state::Config;
+use crate::{error::AmmError, state::Config};
 
 #[derive(Accounts)]
 #[instruction(seed: u64)]
 pub struct Initialize<'info> {
     #[account(mut)]
     pub initializer: Signer<'info>,
+
     pub mint_x: Account<'info, Mint>,
     pub mint_y: Account<'info, Mint>,
-    #[account(
-        init,
-        payer = initializer,
-        seeds = [b"lp", config.key.as_ref()],
-        bump,
-        mint::decimals = 6,
-        mint::authority = config,
-    )]
-    pub mint_lp: Account<'info, Mint>,
-    #[account(
-        init,
-        payer = initializer,
-        associated_token::mint = mint_x,
-        associated_token::authority = config,
-    )]
-    pub vault_x: Account<'info, TokenAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        associated_token::mint = mint_y,
-        associated_token::authority = config,
-    )]
-    pub vault_y: Account<'info, TokenAccount>,
+
     #[account(
         init,
         payer = initializer,
@@ -44,6 +23,56 @@ pub struct Initialize<'info> {
         space = Config::DISCRIMINATOR.len() + Config::INIT_SPACE,
     )]
     pub config: Account<'info, Config>,
+
+    #[account(
+        init,
+        payer = initializer,
+        seeds = [b"lp", config.key().as_ref()],
+        bump,
+        mint::decimals = 6,
+        mint::authority = config,
+    )]
+    pub mint_lp: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_x,
+        associated_token::authority = config,
+    )]
+    pub vault_x: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_y,
+        associated_token::authority = config,
+    )]
+    pub vault_y: Account<'info, TokenAccount>,
+
+    /// CHECK: This PDA is used only as the authority of the treasury token accounts.
+    #[account(
+        seeds = [b"treasury", config.key().as_ref()],
+        bump,
+    )]
+    pub treasury_authority: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_x,
+        associated_token::authority = treasury_authority,
+    )]
+    pub treasury_x: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = initializer,
+        associated_token::mint = mint_y,
+        associated_token::authority = treasury_authority,
+    )]
+    pub treasury_y: Account<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
@@ -57,6 +86,10 @@ impl<'info> Initialize<'info> {
         authority: Option<Pubkey>,
         bumps: InitializeBumps,
     ) -> Result<()> {
+        // Fee is expressed in basis points. 10,000 = 100%.
+        // A 100% fee would leave no amount available for the swap.
+        require!(fee < 10_000, AmmError::FeePercentErr);
+
         self.config.set_inner(Config {
             seed,
             authority,
